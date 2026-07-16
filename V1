@@ -1,0 +1,129 @@
+import datetime
+import os
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, JSON
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# --- ၁။ DATABASE SETUP ---
+Base = declarative_base()
+
+class Result(Base):
+    __tablename__ = 'results'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    draw_date = Column(DateTime, default=datetime.datetime.utcnow)
+    winning_number = Column(String(2), nullable=False)
+    digit_1 = Column(Integer, nullable=False)
+    digit_2 = Column(Integer, nullable=False)
+
+class Prediction(Base):
+    __tablename__ = 'predictions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_date = Column(DateTime, default=datetime.datetime.utcnow)
+    top_candidates = Column(JSON, nullable=False)
+    applied_weights = Column(JSON, nullable=False)
+
+class StrategyWeight(Base):
+    __tablename__ = 'strategy_weights'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+    weights = Column(JSON, nullable=False)
+
+# Database ချိတ်ဆက်ခြင်း
+engine = create_engine("sqlite:///dubai_2d.db", connect_args={"check_same_thread": False})
+Base.metadata.create_all(bind=engine)
+Session = sessionmaker(bind=engine)
+db = Session()
+
+# Default Weights သတ်မှတ်ချက်
+DEFAULT_WEIGHTS = {"trend": 0.40, "gap": 0.30, "frequency": 0.20, "markov": 0.10}
+
+# --- ၂။ AI & STATISTICAL ENGINE ---
+class StatisticalEngine:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+
+    def get_predictions(self, weights: dict) -> list:
+        if self.df.empty:
+            # Data မရှိသေးရင် Default အနေနဲ့ ပုံမှန်ပေးထားမည်
+            return [{"number": f"{i:02d}", "composite_score": 0.01, "breakdown": {}} for i in range(100)]
+
+        # Frequency & Gap တွက်ချက်မှု
+        freq = self.df['winning_number'].astype(int).value_counts(normalize=True).to_dict()
+        
+        gap_scores = {}
+        for n in range(100):
+            idx = self.df[self.df['winning_number'].astype(int) == n].index
+            gap_scores[n] = 1.0 if len(idx) == 0 else min((len(self.df) - 1 - idx[-1]) / 100.0, 1.0)
+
+        candidates = []
+        for n in range(100):
+            score_freq = freq.get(n, 0.0)
+            score_gap = gap_scores.get(n, 1.0)
+            score_trend = score_freq * 0.5 + (1.0 - score_gap) * 0.5
+            score_mk = 0.01  # Markov Chain အခြေခံ တန်ဖိုး
+
+            # Composite Score တွက်ချက်ခြင်း
+            composite = (
+                weights.get('trend', 0.4) * score_trend +
+                weights.get('gap', 0.3) * score_gap +
+                weights.get('frequency', 0.2) * score_freq +
+                weights.get('markov', 0.1) * score_mk
+            )
+
+            candidates.append({
+                "number": f"{n:02d}",
+                "composite_score": float(composite),
+                "breakdown": {"trend": score_trend, "gap": score_gap, "frequency": score_freq, "markov": score_mk}
+            })
+
+        return sorted(candidates, key=lambda x: x['composite_score'], reverse=True)
+
+# --- ၃။ STREAMLIT USER INTERFACE (DASHBOARD) ---
+st.set_page_config(layout="wide", page_title="Dubai 2D AI Lite")
+st.title("📊 Dubai 2D AI Research Platform (Lite)")
+
+# Sidebar တွင် ဂဏန်းအသစ်သွင်းရန် နေရာ
+st.sidebar.header("📥 Result အသစ် ထည့်သွင်းရန်")
+new_num = st.sidebar.text_input("ထွက်ဂဏန်း (ဥပမာ - 45):", max_chars=2)
+
+if st.sidebar.button("ရလဒ် သိမ်းဆည်းမည်"):
+    if len(new_num) == 2 and new_num.isdigit():
+        res = Result(winning_number=new_num, digit_1=int(new_num[0]), digit_2=int(new_num[1]))
+        db.add(res)
+        db.commit()
+        st.sidebar.success(f"ဂဏန်း {new_num} ကို သိမ်းဆည်းပြီးပါပြီ။")
+        st.rerun()
+    else:
+        st.sidebar.error("ဂဏန်း ၂ လုံး တိတိ သွင်းပေးပါ။")
+
+# ဒေတာများ ဆွဲထုတ်ခြင်း
+all_results = db.query(Result).all()
+df_res = pd.DataFrame([{"winning_number": r.winning_number, "digit_1": r.digit_1, "digit_2": r.digit_2} for r in all_results])
+
+# Dynamic Prediction တွက်ချက်မှု
+engine_instance = StatisticalEngine(df_res)
+predictions = engine_instance.get_predictions(DEFAULT_WEIGHTS)
+
+# ပြသပေးမည့် နေရာ
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.subheader("🔮 AI Predicted Candidates")
+    pred_df = pd.DataFrame(predictions)
+    st.markdown("**High Confidence (Top 5)**")
+    st.dataframe(pred_df[['number', 'composite_score']].head(5), use_container_width=True)
+    
+    st.markdown("**Ranked (Top 10)**")
+    st.dataframe(pred_df[['number', 'composite_score']].iloc[5:10], use_container_width=True)
+
+with col2:
+    st.subheader("📈 State Matrix Heatmap")
+    if not df_res.empty:
+        heatmap_data = pd.crosstab(df_res['digit_1'], df_res['digit_2']).reindex(range(10), fill_value=0).fillna(0)
+        fig = px.imshow(heatmap_data, labels=dict(x="Digit 2", y="Digit 1"), color_continuous_scale='Blues')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("တွက်ချက်ရန်အတွက် Result အသစ်များ အရင်ထည့်သွင်းပေးပါ။")
